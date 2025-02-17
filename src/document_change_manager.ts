@@ -1,42 +1,67 @@
-import diff from "fast-diff";
-import { NeovimClient } from "neovim";
+import { Mutex } from "async-mutex";
 import {
     Disposable,
     EndOfLine,
     Position,
     ProgressLocation,
-    Range,
     Selection,
     TextDocument,
     TextDocumentChangeEvent,
     window,
     workspace,
+    LogLevel,
 } from "vscode";
-import { Mutex } from "async-mutex";
 
+import actions from "./actions";
 import { BufferManager } from "./buffer_manager";
-import { Logger } from "./logger";
-import { NeovimExtensionRequestProcessable } from "./neovim_events_processable";
+import { createLogger } from "./logger";
+import { MainController } from "./main_controller";
 import {
-    accumulateDotRepeatChange,
-    applyEditorDiffOperations,
-    callAtomic,
-    computeEditorOperationsFromDiff,
-    diffLineToChars,
-    convertCharNumToByteNum,
     DotRepeatChange,
+    ManualPromise,
+    Progress,
+    accumulateDotRepeatChange,
+    calcDiffWithPosition,
+    convertCharNumToByteNum,
+    disposeAll,
     getDocumentLineArray,
     isChangeSubsequentToChange,
     isCursorChange,
     normalizeDotRepeatChange,
-    prepareEditRangesFromDiff,
-    ManualPromise,
 } from "./utils";
-import { MainController } from "./main_controller";
 
-const LOG_PREFIX = "DocumentChangeManager";
+const logger = createLogger("DocumentChangeManager");
 
-export class DocumentChangeManager implements Disposable, NeovimExtensionRequestProcessable {
+/**
+ * The document content in neovim.
+ */
+interface IDocumentContent {
+    text: string;
+    version: number;
+}
+
+/**
+ * Encapsulates the document information when a document change event is received,
+ * so it can be processed sequentially in a queue.
+ */
+class DocumentChange {
+    public readonly text: string;
+    public readonly version: number;
+    public readonly isDirty: boolean;
+    public readonly contentChanges: TextDocumentChangeEvent["contentChanges"];
+    public get isDirtyStateChange() {
+        return this.contentChanges.length === 0;
+    }
+
+    constructor(changeEvent: TextDocumentChangeEvent) {
+        this.text = changeEvent.document.getText();
+        this.version = changeEvent.document.version;
+        this.isDirty = changeEvent.document.isDirty;
+        this.contentChanges = changeEvent.contentChanges;
+    }
+}
+
+export class DocumentChangeManager implements Disposable {
     private disposables: Disposable[] = [];
     /**
      * Array of pending events to apply in batch
@@ -71,36 +96,46 @@ export class DocumentChangeManager implements Disposable, NeovimExtensionRequest
      * ! This is used to convert vscode ranges to neovim bytes.
      * ! It's possible to just fetch content from neovim and check instead of tracking here, but this will add unnecessary lag
      */
-    private documentContentInNeovim: WeakMap<TextDocument, string> = new WeakMap();
+    private documentContentInNeovim: WeakMap<TextDocument, IDocumentContent> = new WeakMap();
+    /**
+     * Queue of document changes to apply
+     *
+     * Typically, documents are initialized before user edits, so changes are timely and valid
+     * In cases like output or chat code blocks, the document and editor are created simultaneously with rapid changes
+     * Initialization might not be complete, causing content to become outdated
+     * Thus, retain all changes and filter out outdated ones during processing
+     */
+    private documentChangeQueue: WeakMap<TextDocument, DocumentChange[]> = new WeakMap();
     /**
      * Dot repeat workaround
      */
     private dotRepeatChange: DotRepeatChange | undefined;
     /**
-     * A hint for dot-repeat indicating of how the insert mode was started
-     */
-    private dotRepeatStartModeInsertHint?: "o" | "O";
-    /**
      * True when we're currently applying edits, so incoming changes will go into pending events queue
      */
     private applyingEdits = false;
+    /**
+     * Represents the progress of applying edits.
+     */
+    private applyingEditsProgress: Progress;
     /**
      * Lock edits being sent to neovim
      */
     public documentChangeLock = new Mutex();
 
-    public constructor(
-        private logger: Logger,
-        private client: NeovimClient,
-        private main: MainController,
-    ) {
+    private get client() {
+        return this.main.client;
+    }
+
+    public constructor(private main: MainController) {
         this.main.bufferManager.onBufferEvent = this.onNeovimChangeEvent;
         this.main.bufferManager.onBufferInit = this.onBufferInit;
-        this.disposables.push(workspace.onDidChangeTextDocument(this.onChangeTextDocument));
+        this.applyingEditsProgress = new Progress();
+        this.disposables.push(this.applyingEditsProgress, workspace.onDidChangeTextDocument(this.onChangeTextDocument));
     }
 
     public dispose(): void {
-        this.disposables.forEach((d) => d.dispose());
+        disposeAll(this.disposables);
     }
 
     public eatDocumentCursorAfterChange(doc: TextDocument): Position | undefined {
@@ -121,79 +156,29 @@ export class DocumentChangeManager implements Disposable, NeovimExtensionRequest
         return (this.textDocumentChangePromise.get(doc)?.length || 0) > 0;
     }
 
-    public async handleExtensionRequest(name: string, args: unknown[]): Promise<void> {
-        if (name === "insert-line") {
-            const [type] = args as ["before" | "after"];
-            this.dotRepeatStartModeInsertHint = type === "before" ? "O" : "o";
-            this.logger.debug(`${LOG_PREFIX}: Setting start insert mode hint - ${this.dotRepeatStartModeInsertHint}`);
-        }
-    }
-
     public async syncDotRepeatWithNeovim(): Promise<void> {
-        // dot-repeat executes last change across all buffers. So we'll create a temporary buffer & window,
+        // dot-repeat executes last change across all buffers.
+        // So we'll create a temporary buffer & window,
         // replay last changes here to trick neovim and destroy it after
-        if (!this.dotRepeatChange) {
-            return;
-        }
-        this.logger.debug(`${LOG_PREFIX}: Syncing dot repeat`);
-        const dotRepeatChange = { ...this.dotRepeatChange };
+        if (!this.dotRepeatChange) return;
+        const edits = this.dotRepeatChange.text.replace(/\r\n/g, "\n");
+        const deletes = this.dotRepeatChange.rangeLength;
         this.dotRepeatChange = undefined;
-
-        const currWin = await this.client.window;
-
-        // temporary buffer to replay the changes
-        const buf = await this.client.createBuffer(false, true);
-        if (typeof buf === "number") {
-            return;
+        if (!edits.length && !deletes) return;
+        try {
+            await actions.lua("dotrepeat_sync", edits, deletes);
+        } finally {
+            await actions.lua("dotrepeat_restore", edits, deletes);
         }
-        // create temporary win
-        await this.client.setOption("eventignore", "BufWinEnter,BufEnter,BufLeave");
-        const win = await this.client.openWindow(buf, true, {
-            external: true,
-            width: 100,
-            height: 100,
-        });
-        await this.client.setOption("eventignore", "");
-        if (typeof win === "number") {
-            return;
-        }
-        const edits: [string, unknown[]][] = [];
-
-        // for delete changes we need an actual text, so let's prefill with something
-        // accumulate all possible lengths of deleted text to be safe
-        const delRangeLength = dotRepeatChange.rangeLength;
-        if (delRangeLength) {
-            const stub = new Array(delRangeLength).fill("x").join("");
-            edits.push(
-                ["nvim_buf_set_lines", [buf.id, 0, 0, false, [stub]]],
-                ["nvim_win_set_cursor", [win.id, [1, delRangeLength]]],
-            );
-        }
-        let editStr = "";
-        if (dotRepeatChange.startMode) {
-            editStr += `<Esc>${dotRepeatChange.startMode}`;
-            // remove EOL from first change
-            if (dotRepeatChange.text.startsWith(dotRepeatChange.eol)) {
-                dotRepeatChange.text = dotRepeatChange.text.slice(dotRepeatChange.eol.length);
-            }
-        }
-        if (dotRepeatChange.rangeLength) {
-            editStr += [...new Array(dotRepeatChange.rangeLength).keys()].map(() => "<BS>").join("");
-        }
-        editStr += dotRepeatChange.text.split(dotRepeatChange.eol).join("\n").replace("<", "<LT>");
-        edits.push(["nvim_input", [editStr]]);
-        // since nvim_input is not blocking we need replay edits first, then clean up things in subsequent request
-        await callAtomic(this.client, edits, this.logger, LOG_PREFIX);
-
-        const cleanEdits: [string, unknown[]][] = [];
-        cleanEdits.push(["nvim_set_current_win", [currWin.id]]);
-        cleanEdits.push(["nvim_win_close", [win.id, true]]);
-        await callAtomic(this.client, cleanEdits, this.logger, LOG_PREFIX);
     }
 
-    private onBufferInit: BufferManager["onBufferInit"] = (id, doc) => {
-        this.logger.debug(`${LOG_PREFIX}: Init buffer content for bufId: ${id}, uri: ${doc.uri.toString()}`);
-        this.documentContentInNeovim.set(doc, doc.getText());
+    private onBufferInit: BufferManager["onBufferInit"] = (bufId, doc, initText, initVersion) => {
+        logger.log(
+            doc.uri,
+            LogLevel.Debug,
+            `Init buffer content for bufId: ${bufId}, uri: ${doc.uri}, version: ${initVersion}`,
+        );
+        this.documentContentInNeovim.set(doc, { text: initText, version: initVersion });
     };
 
     private onNeovimChangeEvent: BufferManager["onBufferEvent"] = (
@@ -204,20 +189,20 @@ export class DocumentChangeManager implements Disposable, NeovimExtensionRequest
         linedata,
         more,
     ) => {
-        this.logger.debug(`${LOG_PREFIX}: Received neovim buffer changed event for bufId: ${bufId}, tick: ${tick}`);
         const doc = this.main.bufferManager.getTextDocumentForBufferId(bufId);
+        logger.log(doc?.uri, LogLevel.Debug, `Received neovim buffer changed event for bufId: ${bufId}, tick: ${tick}`);
         if (!doc) {
-            this.logger.debug(`${LOG_PREFIX}: No text document for buffer: ${bufId}`);
+            logger.log(undefined, LogLevel.Debug, `No text document for buffer: ${bufId}`);
             return;
         }
         const skipTick = this.bufferSkipTicks.get(bufId) || 0;
         if (skipTick >= tick) {
-            this.logger.debug(`${LOG_PREFIX}: BufId: ${bufId} skipping tick: ${tick}`);
+            logger.log(doc.uri, LogLevel.Debug, `BufId: ${bufId} skipping tick: ${tick}`);
             return;
         }
         // happens after undo
         if (firstLine === lastLine && linedata.length === 0) {
-            this.logger.debug(`${LOG_PREFIX}: BufId: ${bufId} empty change, skipping`);
+            logger.log(doc.uri, LogLevel.Debug, `BufId: ${bufId} empty change, skipping`);
             return;
         }
         if (!this.textDocumentChangePromise.has(doc)) {
@@ -233,29 +218,23 @@ export class DocumentChangeManager implements Disposable, NeovimExtensionRequest
 
     private applyEdits = async (): Promise<void> => {
         this.applyingEdits = true;
-        this.logger.debug(`${LOG_PREFIX}: Applying neovim edits`);
+        logger.log(undefined, LogLevel.Debug, `Applying neovim edits`);
         // const edits = this.pendingEvents.splice(0);
-        let resolveProgress: undefined | (() => void);
-        const progressTimer = setTimeout(() => {
-            window.withProgress<void>(
-                { location: ProgressLocation.Notification, title: "Applying neovim edits" },
-                () => new Promise((res) => (resolveProgress = res)),
-            );
-        }, 1000);
-
+        this.applyingEditsProgress.start(
+            { location: ProgressLocation.Notification, title: "Applying neovim edits" },
+            1000,
+        );
         while (this.pendingEvents.length) {
             const newTextByDoc: Map<TextDocument, string[]> = new Map();
-            // eslint-disable-next-line @typescript-eslint/no-unused-vars
             let edit = this.pendingEvents.shift();
             while (edit) {
-                // eslint-disable-next-line @typescript-eslint/no-unused-vars
                 const [bufId, _tick, firstLine, lastLine, data, _more] = edit;
                 const doc = this.main.bufferManager.getTextDocumentForBufferId(bufId);
                 if (!doc) {
-                    this.logger.warn(`${LOG_PREFIX}: No document for ${bufId}, skip`);
+                    logger.log(undefined, LogLevel.Warning, `No document for ${bufId}, skip`);
                     continue;
                 }
-                this.logger.debug(`${LOG_PREFIX}: Accumulating edits for ${doc.uri.toString()}, bufId: ${bufId}`);
+                logger.log(doc.uri, LogLevel.Debug, `Accumulating edits for ${doc.uri.toString()}, bufId: ${bufId}`);
                 if (!newTextByDoc.get(doc)) {
                     newTextByDoc.set(doc, getDocumentLineArray(doc));
                 }
@@ -310,96 +289,37 @@ export class DocumentChangeManager implements Disposable, NeovimExtensionRequest
             for (const [doc, newLines] of newTextByDoc) {
                 const lastPromiseIdx = this.textDocumentChangePromise.get(doc)?.length || 0;
                 try {
-                    this.logger.debug(`${LOG_PREFIX}: Applying edits for ${doc.uri.toString()}`);
+                    logger.log(doc.uri, LogLevel.Debug, `Applying edits for ${doc.uri.toString()}`);
                     if (doc.isClosed) {
-                        this.logger.debug(`${LOG_PREFIX}: Document was closed, skippnig`);
+                        logger.log(doc.uri, LogLevel.Debug, `Document was closed, skippnig`);
                         continue;
                     }
                     const editor = window.visibleTextEditors.find((e) => e.document === doc);
                     if (!editor) {
-                        this.logger.debug(`${LOG_PREFIX}: No visible text editor for document, skipping`);
+                        logger.log(doc.uri, LogLevel.Debug, `No visible text editor for document, skipping`);
                         continue;
                     }
-                    let oldText = doc.getText();
-                    const eol = doc.eol === EndOfLine.CRLF ? "\r\n" : "\n";
-                    let newText = newLines.join(eol);
-                    // add few lines to the end otherwise diff may be wrong for a newline characters
-                    oldText += `${eol}end${eol}end`;
-                    newText += `${eol}end${eol}end`;
-                    const diffPrepare = diffLineToChars(oldText, newText);
-                    const d = diff(diffPrepare.chars1, diffPrepare.chars2);
-                    const ranges = prepareEditRangesFromDiff(d);
-                    if (!ranges.length) {
-                        continue;
-                    }
-                    this.documentSkipVersionOnChange.set(doc, doc.version + 1);
+                    const oldText = doc.getText().replace(/\r\n/g, "\n");
+                    const newText = newLines.join("\n");
 
                     const cursorBefore = editor.selection.active;
+
+                    // 1. Manually increment document version to avoid unexpected updates
+                    this.documentSkipVersionOnChange.set(doc, doc.version + 1);
                     const success = await editor.edit(
                         (builder) => {
-                            for (const range of ranges) {
-                                const text = newLines.slice(range.newStart, range.newEnd + 1);
-                                if (range.type === "removed") {
-                                    if (range.end >= editor.document.lineCount - 1 && range.start > 0) {
-                                        const startChar = editor.document.lineAt(range.start - 1).range.end.character;
-                                        builder.delete(new Range(range.start - 1, startChar, range.end, 999999));
-                                    } else {
-                                        builder.delete(new Range(range.start, 0, range.end + 1, 0));
-                                    }
-                                } else if (range.type === "changed") {
-                                    // builder.delete(new Range(range.start, 0, range.end, 999999));
-                                    // builder.insert(new Position(range.start, 0), text.join("\n"));
-                                    // !builder.replace() can select text. This usually happens when you add something at end of a line
-                                    // !We're trying to mitigate it here by checking if we're just adding characters and using insert() instead
-                                    // !As fallback we look after applying edits if we have selection
-                                    const oldText = editor.document
-                                        .getText(new Range(range.start, 0, range.end, 99999))
-                                        .replace("\r\n", "\n");
-                                    const newText = text.join("\n");
-                                    if (newText.length > oldText.length && newText.startsWith(oldText)) {
-                                        builder.insert(
-                                            new Position(range.start, oldText.length),
-                                            newText.slice(oldText.length),
-                                        );
-                                    } else {
-                                        const changeSpansOneLineOnly =
-                                            range.start == range.end && range.newStart == range.newEnd;
-
-                                        let editorOps;
-
-                                        if (changeSpansOneLineOnly) {
-                                            editorOps = computeEditorOperationsFromDiff(diff(oldText, newText));
-                                        }
-
-                                        // If supported, efficiently modify only part of line that has changed by
-                                        // generating a diff and computing editor operations from it. This prevents
-                                        // flashes of non syntax-highlighted text (e.g. when `x` or `cw`, only
-                                        // remove a single char/the word).
-                                        if (editorOps && changeSpansOneLineOnly) {
-                                            applyEditorDiffOperations(builder, { editorOps, line: range.newStart });
-                                        } else {
-                                            builder.replace(
-                                                new Range(range.start, 0, range.end, 999999),
-                                                text.join("\n"),
-                                            );
-                                        }
-                                    }
-                                } else if (range.type === "added") {
-                                    if (range.start >= editor.document.lineCount) {
-                                        text.unshift(
-                                            ...new Array(range.start - (editor.document.lineCount - 1)).fill(""),
-                                        );
-                                    } else {
-                                        text.push("");
-                                    }
-                                    builder.insert(new Position(range.start, 0), text.join("\n"));
-                                    // !builder.replace() selects text
-                                    // builder.replace(new Position(range.start, 0), text.join("\n"));
-                                }
+                            const changes = calcDiffWithPosition(oldText, newText);
+                            for (const { range, text } of changes) {
+                                builder.replace(range, text);
                             }
                         },
                         { undoStopAfter: false, undoStopBefore: false },
                     );
+                    // 2. Set the actual version number after applying changes to prevent loss of the next update
+                    // Although successful, the document version may not actually increase.
+                    // Example: Using "S" to delete empty line does not actually change the text.
+                    this.documentSkipVersionOnChange.set(doc, doc.version);
+
                     const docPromises = this.textDocumentChangePromise.get(doc)?.splice(0, lastPromiseIdx) || [];
                     if (success) {
                         if (!editor.selection.anchor.isEqual(editor.selection.active)) {
@@ -413,19 +333,23 @@ export class DocumentChangeManager implements Disposable, NeovimExtensionRequest
                         }
                         this.cursorAfterTextDocumentChange.set(editor.document, editor.selection.active);
                         docPromises.forEach((p) => p.resolve && p.resolve());
-                        this.logger.debug(`${LOG_PREFIX}: Changes succesfully applied for ${doc.uri.toString()}`);
-                        this.documentContentInNeovim.set(doc, doc.getText());
+                        logger.log(doc.uri, LogLevel.Debug, `Changes succesfully applied for ${doc.uri.toString()}`);
+                        this.documentContentInNeovim.set(doc, { text: doc.getText(), version: doc.version });
                     } else {
                         docPromises.forEach((p) => {
                             p.promise.catch(() =>
-                                this.logger.warn(`${LOG_PREFIX}: Edit was canceled for doc: ${doc.uri.toString()}`),
+                                logger.log(
+                                    doc.uri,
+                                    LogLevel.Warning,
+                                    `Edit was canceled for doc: ${doc.uri.toString()}`,
+                                ),
                             );
                             p.reject();
                         });
-                        this.logger.warn(`${LOG_PREFIX}: Changes were not applied for ${doc.uri.toString()}`);
+                        logger.log(doc.uri, LogLevel.Warning, `Changes were not applied for ${doc.uri.toString()}`);
                     }
                 } catch (e) {
-                    this.logger.error(`${LOG_PREFIX}: Error applying neovim edits, error: ${(e as Error).message}`);
+                    logger.log(doc.uri, LogLevel.Error, `Error applying neovim edits, error: ${(e as Error).message}`);
                 }
             }
         }
@@ -433,91 +357,122 @@ export class DocumentChangeManager implements Disposable, NeovimExtensionRequest
         this.textDocumentChangePromise.clear();
         promises.forEach((p) => p.resolve && p.resolve());
         // better to be safe - if event was inserted after exit the while() block but before exit the function
-        if (progressTimer) {
-            clearTimeout(progressTimer);
-        }
-        if (resolveProgress) {
-            resolveProgress();
-        }
+        this.applyingEditsProgress.done();
         if (this.pendingEvents.length) {
             this.applyEdits();
+        } else {
+            this.applyingEdits = false;
         }
-        this.applyingEdits = false;
     };
 
     private onChangeTextDocument = async (e: TextDocumentChangeEvent): Promise<void> => {
         const { document: doc } = e;
-        const origText = this.documentContentInNeovim.get(doc);
-        if (origText == null) {
-            this.logger.warn(`${LOG_PREFIX}: Can't get last known neovim content for ${doc.uri.toString()}, skipping`);
-            return;
+
+        if (!this.documentChangeQueue.has(doc)) {
+            this.documentChangeQueue.set(doc, []);
         }
-        this.documentContentInNeovim.set(doc, doc.getText());
-        await this.documentChangeLock.runExclusive(async () => await this.onChangeTextDocumentLocked(e, origText));
+        const documentChange = new DocumentChange(e);
+        this.documentChangeQueue.get(doc)!.push(documentChange);
+
+        if (!this.documentContentInNeovim.has(doc)) return;
+
+        await this.documentChangeLock.runExclusive(async () => {
+            const queuedChanges = this.documentChangeQueue.get(doc) ?? [];
+            this.documentChangeQueue.set(doc, []);
+            for (const change of queuedChanges) {
+                await this.processTextDocumentChange(doc, change);
+            }
+        });
     };
 
-    private onChangeTextDocumentLocked = async (e: TextDocumentChangeEvent, origText: string): Promise<void> => {
-        const { document: doc, contentChanges } = e;
+    private processTextDocumentChange = async (doc: TextDocument, change: DocumentChange): Promise<void> => {
+        const lastKnownContent = this.documentContentInNeovim.get(doc);
+        if (!lastKnownContent) return; // won't happen
+        const { contentChanges, isDirty, isDirtyStateChange, version } = change;
+        if (!isDirtyStateChange && version <= lastKnownContent.version) return;
 
-        this.logger.debug(`${LOG_PREFIX}: Change text document for uri: ${doc.uri.toString()}`);
-        this.logger.debug(
-            `${LOG_PREFIX}: Version: ${doc.version}, skipVersion: ${this.documentSkipVersionOnChange.get(doc)}`,
-        );
-        if ((this.documentSkipVersionOnChange.get(doc) ?? 0) >= doc.version) {
-            this.logger.debug(`${LOG_PREFIX}: Skipping a change since versions equals`);
+        this.documentContentInNeovim.set(doc, { text: change.text, version: change.version });
+
+        logger.log(doc.uri, LogLevel.Debug, `Change text document for: ${doc.uri}`);
+        const editor = window.visibleTextEditors.find((e) => e.document === doc);
+        const bufId = this.main.bufferManager.getBufferIdForTextDocument(doc);
+        if (!bufId) {
+            logger.log(doc.uri, LogLevel.Warning, `No neovim buffer for ${doc.uri}`);
             return;
         }
 
-        const bufId = this.main.bufferManager.getBufferIdForTextDocument(doc);
-        if (!bufId) {
-            this.logger.warn(`${LOG_PREFIX}: No neovim buffer for ${doc.uri.toString()}`);
+        // Manually setting 'modified' may interfere with Neovim's management of the 'modified' state,
+        // for example, not resetting 'modified' after an undo operation.
+        // 1. VSCode may trigger a dirty change before a content change.
+        // 2. The dirty flag may be false, but the content changes are not empty.
+        // 3. If content changes and dirty is true, it will be automatically set when syncing the content change to Neovim.
+        // Therefore, when isDirty is false, 'modified' needs to be manually set to false before and after syncing.
+        // When isDirty is true, Neovim will automatically set 'modified' to true after syncing.
+        if (isDirtyStateChange && !isDirty) {
+            await this.client.request("nvim_buf_set_option", [bufId, "modified", false]);
+        }
+
+        const skipVersion = this.documentSkipVersionOnChange.get(doc) ?? 0;
+        logger.log(doc.uri, LogLevel.Debug, `Version: ${version}, skipVersion: ${skipVersion}`);
+        if (skipVersion >= version) {
+            logger.log(doc.uri, LogLevel.Debug, `Skipping a change since versions equals`);
             return;
         }
 
         const eol = doc.eol === EndOfLine.LF ? "\n" : "\r\n";
-        const startModeHint = this.dotRepeatStartModeInsertHint;
         const activeEditor = window.activeTextEditor;
 
         // Store dot repeat
         if (activeEditor && activeEditor.document === doc && this.main.modeManager.isInsertMode) {
-            this.dotRepeatStartModeInsertHint = undefined;
             const cursor = activeEditor.selection.active;
             for (const change of contentChanges) {
                 if (isCursorChange(change, cursor, eol)) {
                     if (this.dotRepeatChange && isChangeSubsequentToChange(change, this.dotRepeatChange)) {
                         this.dotRepeatChange = accumulateDotRepeatChange(change, this.dotRepeatChange);
                     } else {
-                        this.dotRepeatChange = normalizeDotRepeatChange(change, eol, startModeHint);
+                        this.dotRepeatChange = normalizeDotRepeatChange(change, eol);
                     }
                 }
             }
         }
 
-        const requests: [string, unknown[]][] = [];
-
-        for (const c of contentChanges) {
-            const start = c.range.start;
-            const end = c.range.end;
-            const text = c.text;
-            const startBytes = convertCharNumToByteNum(origText.split(eol)[start.line], start.character);
-            const endBytes = convertCharNumToByteNum(origText.split(eol)[end.line], end.character);
-            requests.push(["nvim_buf_set_text", [bufId, start.line, startBytes, end.line, endBytes, text.split(eol)]]);
+        const lastLines = lastKnownContent.text.split(eol);
+        const changeArgs = [];
+        for (const change of contentChanges) {
+            const {
+                text,
+                range: { start, end },
+            } = change;
+            const startBytes = convertCharNumToByteNum(lastLines[start.line], start.character);
+            const endBytes = convertCharNumToByteNum(lastLines[end.line], end.character);
+            changeArgs.push([start.line, startBytes, end.line, endBytes, text.split(eol)] as const);
         }
 
         const bufTick: number = await this.client.request("nvim_buf_get_changedtick", [bufId]);
         if (!bufTick) {
-            this.logger.warn(`${LOG_PREFIX}: Can't get changed tick for bufId: ${bufId}, deleted?`);
+            logger.log(doc.uri, LogLevel.Warning, `Can't get changed tick for bufId: ${bufId}, deleted?`);
             return;
         }
-        this.logger.debug(
-            `${LOG_PREFIX}: BufId: ${bufId}, lineChanges: ${requests.length}, tick: ${bufTick}, skipTick: ${
-                bufTick + requests.length
-            }`,
-        );
-        this.bufferSkipTicks.set(bufId, bufTick + contentChanges.length);
 
-        this.logger.debug(`${LOG_PREFIX}: Setting wantInsertCursorUpdate to false`);
-        this.main.cursorManager.wantInsertCursorUpdate = false;
-        if (requests.length) await callAtomic(this.client, requests, this.logger, LOG_PREFIX);
+        this.bufferSkipTicks.set(bufId, bufTick + changeArgs.length);
+
+        logger.log(doc.uri, LogLevel.Debug, `Setting wantInsertCursorUpdate to false`);
+        if (editor) this.main.cursorManager.setWantInsertCursorUpdate(editor, false);
+
+        await actions.lua("handle_changes", bufId, changeArgs);
+
+        if (!isDirty) {
+            await this.client.request("nvim_buf_set_option", [bufId, "modified", false]);
+        }
+
+        // Mainly for the changes caused by some vscode commands in visual mode.
+        // e.g. move line up/down
+        // After synchronizing the changes to nvim, the cursor
+        // position/visual range of nvim will change. And the changed result is
+        // usually incorrect, so synchronization is forced here.
+        if (editor && editor === activeEditor && !this.main.modeManager.isInsertMode) {
+            // Don't await here, since it will cause a deadlock
+            this.main.cursorManager.applySelectionChanged(editor);
+        }
     };
 }

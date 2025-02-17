@@ -1,12 +1,19 @@
-import { NeovimClient } from "neovim";
-import { Disposable, TextEditor, window, TextEditorVisibleRangesChangeEvent, Position } from "vscode";
+import { DebouncedFunc, debounce } from "lodash";
+import {
+    Disposable,
+    EventEmitter,
+    Position,
+    TextEditor,
+    TextEditorVisibleRangesChangeEvent,
+    window,
+    workspace,
+} from "vscode";
 
-import { Logger } from "./logger";
+import actions from "./actions";
+import { config } from "./config";
+import { EventBusData, eventBus } from "./eventBus";
 import { MainController } from "./main_controller";
-import { NeovimExtensionRequestProcessable, NeovimRedrawProcessable } from "./neovim_events_processable";
-
-const LOG_PREFIX = "ViewportManager";
-
+import { ManualPromise, disposeAll } from "./utils";
 // all 0-indexed
 export class Viewport {
     line = 0; // current line
@@ -17,25 +24,64 @@ export class Viewport {
     skipcol = 0; // skip col (maybe left col)
 }
 
-export class ViewportManager implements Disposable, NeovimRedrawProcessable, NeovimExtensionRequestProcessable {
+export class ViewportManager implements Disposable {
     private disposables: Disposable[] = [];
+
+    private viewportChangedPromise?: ManualPromise;
+
+    public get isSyncDone(): Promise<unknown> {
+        return Promise.resolve(this.viewportChangedPromise?.promise);
+    }
 
     /**
      * Current grid viewport, indexed by grid
      */
     private gridViewport: Map<number, Viewport> = new Map();
 
-    public constructor(
-        private logger: Logger,
-        private client: NeovimClient,
-        private main: MainController,
-        private neovimViewportHeightExtend: number,
-    ) {
-        this.disposables.push(window.onDidChangeTextEditorVisibleRanges(this.onDidChangeVisibleRange));
+    // TODO: Temporary solution. Need to refactor cursor manager and viewport manager.
+    // Related issue: https://github.com/neovim/neovim/issues/28800
+    private cursorChanged = new EventEmitter<number>();
+    public onCursorChanged = this.cursorChanged.event;
+
+    public constructor(private main: MainController) {
+        this.disposables.push(
+            this.cursorChanged,
+            window.onDidChangeTextEditorVisibleRanges(this.onDidChangeVisibleRange),
+            eventBus.on("redraw", this.handleRedraw, this),
+            eventBus.on("viewport-changed", ([view]) => this.handleViewportChanged(view)),
+        );
     }
 
-    public dispose(): void {
-        this.disposables.forEach((d) => d.dispose());
+    private handleViewportChanged({
+        winid,
+        leftcol,
+        skipcol,
+        lnum,
+        col,
+        topline,
+    }: EventBusData<"viewport-changed">[0]) {
+        this.viewportChangedPromise?.resolve();
+        this.viewportChangedPromise = undefined;
+
+        const gridId = this.main.bufferManager.getGridIdForWinId(winid);
+        if (!gridId) return;
+
+        this.viewportChangedPromise = new ManualPromise();
+
+        const view = this.getViewport(gridId);
+        const { line: oldLine, col: oldCol } = view;
+        view.line = lnum;
+        view.col = col;
+        view.topline = topline;
+        view.leftcol = leftcol;
+        view.skipcol = skipcol;
+
+        if (oldLine !== view.line || oldCol !== view.col) {
+            this.cursorChanged.fire(gridId);
+        }
+
+        this.viewportChangedPromise.resolve();
+        this.viewportChangedPromise = undefined;
     }
 
     /**
@@ -66,84 +112,73 @@ export class ViewportManager implements Disposable, NeovimRedrawProcessable, Neo
         return new Position(view.topline, view.leftcol);
     }
 
-    public async handleExtensionRequest(name: string, args: unknown[]): Promise<void> {
+    private handleRedraw({ name, args }: EventBusData<"redraw">) {
         switch (name) {
-            case "window-scroll": {
-                // eslint-disable-next-line @typescript-eslint/no-unused-vars
-                const [winId, saveView] = args as [
-                    number,
-                    {
-                        lnum: number;
-                        col: number;
-                        coladd: number;
-                        curswant: number;
-                        topline: number;
-                        topfill: number;
-                        leftcol: number;
-                        skipcol: number;
-                    },
-                ];
-                const gridId = this.main.bufferManager.getGridIdForWinId(winId);
-                if (!gridId) {
-                    this.logger.warn(`${LOG_PREFIX}: Unable to update scrolled view. No grid for winId: ${winId}`);
-                    break;
+            case "win_viewport": {
+                for (const [grid, , topline, botline, curline, curcol] of args) {
+                    const view = this.getViewport(grid);
+                    const { line, col } = view;
+                    view.topline = topline;
+                    view.botline = botline;
+                    view.line = curline;
+                    view.col = curcol;
+                    if (line !== curline || col !== curcol) {
+                        this.cursorChanged.fire(grid);
+                    }
                 }
-                const view = this.getViewport(gridId);
-                view.leftcol = saveView.leftcol;
-                view.skipcol = saveView.skipcol;
+                break;
+            }
+            case "grid_destroy": {
+                for (const [grid] of args) {
+                    this.gridViewport.delete(grid);
+                }
                 break;
             }
         }
     }
 
-    public handleRedrawBatch(batch: [string, ...unknown[]][]): void {
-        for (const [name, ...args] of batch) {
-            switch (name) {
-                case "win_viewport": {
-                    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-                    for (const [grid, win, topline, botline, curline, curcol, line_count, scroll_delta] of args as [
-                        number,
-                        Window,
-                        number,
-                        number,
-                        number,
-                        number,
-                        number,
-                        number,
-                    ][]) {
-                        const view = this.getViewport(grid);
-                        view.topline = topline;
-                        view.botline = botline;
-                        view.line = curline;
-                        view.col = curcol;
-                    }
-                    break;
-                }
-                case "grid_destroy": {
-                    for (const [grid] of args as [number][]) {
-                        this.gridViewport.delete(grid);
-                    }
-                    break;
-                }
-            }
-        }
+    // #region
+    // FIXME: This is a temporary solution to reduce cursor jitter when scrolling.
+    private debouncedScrollNeovim!: DebouncedFunc<ViewportManager["scrollNeovim"]>;
+    private debounceTime = 20;
+    private refreshDebounceTime(): boolean {
+        const smoothScrolling = workspace.getConfiguration("editor").get("smoothScrolling", false);
+        const debounceTime = smoothScrolling ? 100 : 20; // vscode's scrolling duration is 125ms.
+        const updated = this.debounceTime !== debounceTime;
+        this.debounceTime = debounceTime;
+        return updated;
     }
-
-    private onDidChangeVisibleRange = async (e: TextEditorVisibleRangesChangeEvent): Promise<void> => {
-        this.scrollNeovim(e.textEditor);
+    private refreshDebounceScroll() {
+        this.debouncedScrollNeovim = debounce(this.scrollNeovim.bind(this), this.debounceTime, {
+            leading: false,
+            trailing: true,
+        });
+    }
+    private onDidChangeVisibleRange = (e: TextEditorVisibleRangesChangeEvent) => {
+        if (!this.debouncedScrollNeovim) {
+            this.refreshDebounceTime();
+            this.refreshDebounceScroll();
+            workspace.onDidChangeConfiguration(
+                (e) => e.affectsConfiguration("editor") && this.refreshDebounceTime() && this.refreshDebounceScroll(),
+                null,
+                this.disposables,
+            );
+        }
+        this.debouncedScrollNeovim(e.textEditor);
     };
+    // #endregion
 
     public scrollNeovim(editor: TextEditor | null): void {
         if (editor == null || this.main.modeManager.isInsertMode) {
             return;
         }
         const ranges = editor.visibleRanges;
-        if (!ranges || ranges.length == 0 || ranges[0].end.line - ranges[0].start.line <= 1) {
+        if (!ranges || ranges.length === 0 || ranges[0].end.line - ranges[0].start.line <= 1) {
             return;
         }
-        const startLine = ranges[0].start.line - this.neovimViewportHeightExtend;
+        const startLine = ranges[0].start.line - config.neovimViewportHeightExtend;
         // when it have fold we need get the last range. it need add 1 line on multiple fold
-        const endLine = ranges[ranges.length - 1].end.line + ranges.length + this.neovimViewportHeightExtend;
+        const endLine = ranges[ranges.length - 1].end.line + ranges.length + config.neovimViewportHeightExtend;
         const currentLine = editor.selection.active.line;
 
         const gridId = this.main.bufferManager.getGridIdFromEditor(editor);
@@ -151,8 +186,12 @@ export class ViewportManager implements Disposable, NeovimRedrawProcessable, Neo
             return;
         }
         const viewport = this.gridViewport.get(gridId);
-        if (viewport && startLine != viewport?.topline && currentLine == viewport?.line) {
-            this.client.lua("require('vscode-neovim.api').scroll_viewport(...)", [Math.max(startLine, 0), endLine]);
+        if (viewport && startLine !== viewport?.topline && currentLine === viewport?.line) {
+            actions.lua("scroll_viewport", Math.max(startLine, 0), endLine);
         }
+    }
+
+    dispose() {
+        disposeAll(this.disposables);
     }
 }

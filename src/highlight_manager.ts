@@ -1,44 +1,65 @@
+import { WaitGroup } from "@jpwilliams/waitgroup";
 import { Disposable } from "vscode";
 
-import { HighlightConfiguration, HighlightProvider } from "./highlight_provider";
+import { EventBusData, VimHighlightUIAttributes, eventBus } from "./eventBus";
+import { HighlightGrid } from "./highlights/highlight_grid";
+import { HighlightGroupStore } from "./highlights/highlight_group_store";
+import { VimCell } from "./highlights/types";
 import { MainController } from "./main_controller";
-import { NeovimRedrawProcessable } from "./neovim_events_processable";
-import { calculateEditorColFromVimScreenCol, GridLineEvent } from "./utils";
+import { disposeAll } from "./utils";
 
-// const LOG_PREFIX = "HighlightManager";
+// We have fixed statuscolumn width
+const STATUSCOLUMN_WIDTH = 20;
 
-export class HighlightManager implements Disposable, NeovimRedrawProcessable {
+export class HighlightManager implements Disposable {
     private disposables: Disposable[] = [];
+    private redrawWaitGroup = new WaitGroup();
+    // Manages the highlight groups
+    private groupStore: HighlightGroupStore;
+    // Map of gridId -> HighlightGrid
+    private highlightGrids: Map<number, HighlightGrid> = new Map();
 
-    private highlightProvider: HighlightProvider;
-
-    private commandsDisposables: Disposable[] = [];
-
-    public constructor(
-        private main: MainController,
-        private settings: HighlightConfiguration,
-    ) {
-        this.highlightProvider = new HighlightProvider(settings);
+    public constructor(private main: MainController) {
+        this.groupStore = new HighlightGroupStore();
+        this.disposables.push(
+            this.groupStore,
+            eventBus.on("redraw", this.handleRedraw, this),
+            eventBus.on("flush-redraw", this.handleRedrawFlush, this),
+        );
     }
-    public dispose(): void {
-        this.disposables.forEach((d) => d.dispose());
-        this.commandsDisposables.forEach((d) => d.dispose());
+
+    // Get or create a HighlightGrid for the given gridId
+    private getGrid(gridId: number): HighlightGrid {
+        if (!this.highlightGrids.has(gridId)) {
+            this.highlightGrids.set(
+                gridId,
+                new HighlightGrid(
+                    gridId,
+                    this.groupStore,
+                    this.main.bufferManager,
+                    this.main.viewportManager,
+                    this.main.changeManager,
+                ),
+            );
+        }
+        return this.highlightGrids.get(gridId)!;
     }
 
-    public handleRedrawBatch(batch: [string, ...unknown[]][]): void {
-        const gridHLUpdates: Set<number> = new Set();
+    private async handleRedraw({ name, args }: EventBusData<"redraw">): Promise<void> {
+        // Mark our `redraw` event as processing, so that `redraw-flush` will wait for all async
+        // execution to complete.
+        //
+        // We must do this before the await, so that we ensure that this is queued before
+        // this function returns (and a flush event could begin)
+        this.redrawWaitGroup.add();
 
-        for (const [name, ...args] of batch) {
+        await this.main.viewportManager.isSyncDone;
+
+        try {
             switch (name) {
                 case "hl_attr_define": {
-                    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-                    for (const [id, uiAttrs, , info] of args as [
-                        number,
-                        never,
-                        never,
-                        [{ kind: "ui" | "syntax" | "terminal"; ui_name: string; hi_name: string }],
-                    ][]) {
-                        this.highlightProvider.addHighlightGroup(
+                    for (const [id, uiAttrs, , info] of args) {
+                        this.handleAttrDefine(
                             id,
                             uiAttrs,
                             info.map((i) => i.hi_name),
@@ -46,92 +67,63 @@ export class HighlightManager implements Disposable, NeovimRedrawProcessable {
                     }
                     break;
                 }
-                // nvim may not send grid_cursor_goto and instead uses grid_scroll along with grid_line
-                case "grid_scroll": {
-                    for (const [grid, top, , , , by] of args as [
-                        number,
-                        number,
-                        number,
-                        null,
-                        number,
-                        number,
-                        number,
-                    ][]) {
-                        if (grid === 1) {
-                            continue;
+                // NOTES: We don't handle "grid_scroll" because:
+                // 1. We only need the cells data of the grid and do not need to consider scrolling.
+                // 2. The scrolled-in area will be filled using `grid_line` directly after the scroll event.
+                // Thus, we don't need to clear this area as part of handling the scroll event. (From the neovim-ui doc)
+                case "grid_line": {
+                    for (const [grid, row, col, cells] of args) {
+                        if (grid !== 1) {
+                            this.handleGridLine(grid, row, col, cells);
                         }
-                        // by > 0 - scroll down, must remove existing elements from first and shift row hl left
-                        // by < 0 - scroll up, must remove existing elements from right shift row hl right
-                        this.highlightProvider.shiftGridHighlights(grid, by, top);
-                        gridHLUpdates.add(grid);
                     }
                     break;
                 }
-                case "grid_line": {
-                    // [grid, row, colStart, cells: [text, hlId, repeat]]
-                    const gridEvents = args as GridLineEvent[];
-
-                    // eslint-disable-next-line prefer-const
-                    for (let [grid, row, col, cells] of gridEvents) {
-                        const gridOffset = this.main.viewportManager.getGridOffset(grid);
-                        if (!gridOffset) {
-                            continue;
-                        }
-
-                        const editor = this.main.bufferManager.getEditorFromGridId(grid);
-                        if (!editor) {
-                            continue;
-                        }
-
-                        // const topScreenLine = gridConf.cursorLine === 0 ? 0 : gridConf.cursorLine - gridConf.screenLine;
-                        const topScreenLine = gridOffset.line;
-                        const highlightLine = topScreenLine + row;
-                        if (highlightLine >= editor.document.lineCount || highlightLine < 0) {
-                            if (highlightLine > 0) {
-                                this.highlightProvider.cleanRow(grid, row);
-                                gridHLUpdates.add(grid);
-                            }
-                            continue;
-                        }
-                        const line = editor.document.lineAt(highlightLine).text;
-                        const colStart = col + gridOffset.character;
-                        const tabSize = editor.options.tabSize as number;
-                        const finalStartCol = calculateEditorColFromVimScreenCol(line, colStart, tabSize);
-                        const update = this.highlightProvider.processHLCellsEvent(
-                            grid,
-                            row,
-                            finalStartCol,
-                            line,
-                            cells,
-                        );
-                        if (update) {
-                            gridHLUpdates.add(grid);
-                        }
-                    }
-                    break;
+                case "grid_destroy": {
+                    args.forEach(([grid]) => this.handleGridDestroy(grid));
                 }
             }
-        }
-        if (gridHLUpdates.size) {
-            this.applyHLGridUpdates(gridHLUpdates);
+        } finally {
+            // We don't want to hold a flush up forever if there's
+            // an exception, so we wrap this in a try/finally
+            this.redrawWaitGroup.done();
         }
     }
 
-    private applyHLGridUpdates = (updates: Set<number>): void => {
-        for (const grid of updates) {
-            const gridOffset = this.main.viewportManager.getGridOffset(grid);
-            const editor = this.main.bufferManager.getEditorFromGridId(grid);
-            if (!editor || !gridOffset) {
-                continue;
-            }
-            // !For text changes neovim sends first buf_lines_event followed by redraw event
-            // !But since changes are asynchronous and will happen after redraw event we need to wait for them first
-            this.main.changeManager.getDocumentChangeCompletionLock(editor.document).then(() => {
-                const hls = this.highlightProvider.getGridHighlights(editor, grid, gridOffset.line);
-                for (const [decorator, ranges] of hls) {
-                    editor.setDecorations(decorator, ranges);
-                }
-            });
+    private async handleRedrawFlush() {
+        // Wait for any redraw events that have been received to finish
+        // their work, so that we can flush them only after their changes are staged.
+        await this.redrawWaitGroup.wait();
+        this.highlightGrids.forEach((grid) => grid.handleRedrawFlush());
+    }
+
+    private handleAttrDefine(id: number, attrs: VimHighlightUIAttributes, groups: string[]) {
+        this.groupStore.add(id, attrs, groups);
+    }
+
+    private handleGridLine(gridId: number, row: number, col: number, cells: VimCell[]): void {
+        const gridOffset = this.main.viewportManager.getGridOffset(gridId);
+        const drawLine = gridOffset.line + row;
+        // Offset for the statuscolumn
+        const startCol = col + gridOffset.character;
+        // No reason for startCol to equal STATUSCOLUMN_WIDTH
+        const vimCol = startCol < STATUSCOLUMN_WIDTH ? 0 : startCol - STATUSCOLUMN_WIDTH;
+        if (startCol < STATUSCOLUMN_WIDTH) {
+            // leading dashes could be combined with statuscolumn
+            const delta = STATUSCOLUMN_WIDTH - startCol;
+            if (cells[0][2]! > delta) cells[0][2]! -= delta;
+            else cells.shift();
         }
-    };
+
+        this.getGrid(gridId).handleGridLine(drawLine, vimCol, cells);
+    }
+
+    private handleGridDestroy(gridId: number): void {
+        this.highlightGrids.get(gridId)?.dispose();
+        this.highlightGrids.delete(gridId);
+    }
+
+    dispose(): void {
+        disposeAll(this.disposables);
+    }
 }
