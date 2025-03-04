@@ -1,100 +1,163 @@
-import { NeovimClient } from "neovim";
-import { Disposable } from "vscode";
+import { Disposable, StatusBarAlignment, StatusBarItem, window } from "vscode";
 
-import { Logger } from "./logger";
-import { NeovimRedrawProcessable } from "./neovim_events_processable";
-import { StatusLineController } from "./status_line";
+import { config } from "./config";
+import { EventBusData, eventBus } from "./eventBus";
+import { MainController } from "./main_controller";
+import { disposeAll } from "./utils";
+import { createLogger } from "./logger";
+import { ClearAction, StatusLineMessageTimer } from "./status_line/status_line_message_timer";
 
-export class StatusLineManager implements Disposable, NeovimRedrawProcessable {
+const logger = createLogger("StatusLineManager");
+
+const STATUS_MESSAGE_MIN_TIME = 5000;
+
+enum StatusType {
+    Mode, // msg_showmode
+    Cmd, // msg_showcmd
+    Msg, // msg_show, msg_clear
+    StatusLine, // (custom) statusline
+}
+
+export class StatusLineManager implements Disposable {
     private disposables: Disposable[] = [];
-    /**
-     * Status var UI
-     */
-    private statusLine: StatusLineController;
 
-    public constructor(
-        private logger: Logger,
-        private client: NeovimClient,
-    ) {
-        this.statusLine = new StatusLineController();
-        this.disposables.push(this.statusLine);
+    // ui events
+    private _modeText = "";
+    private _cmdText = "";
+    private _msgText = "";
+
+    private _statusline = "";
+
+    private statusBar: StatusBarItem;
+    private messageDisplayTimer: StatusLineMessageTimer;
+
+    private get client() {
+        return this.main.client;
     }
 
-    public dispose(): void {
-        this.disposables.forEach((d) => d.dispose());
+    public constructor(private main: MainController) {
+        this.statusBar = window.createStatusBarItem("vscode-neovim-status", StatusBarAlignment.Left, -10);
+        this.statusBar.show();
+        this.messageDisplayTimer = new StatusLineMessageTimer(() => {
+            logger.debug("Clearing statusline after timer expiry");
+            this.clearMessages();
+        }, STATUS_MESSAGE_MIN_TIME);
+
+        this.disposables.push(
+            this.statusBar,
+            this.messageDisplayTimer,
+            eventBus.on("redraw", this.handleRedraw, this),
+            eventBus.on("statusline", ([status]) => this.setStatus(status, StatusType.StatusLine)),
+        );
     }
 
-    public handleRedrawBatch(batch: [string, ...unknown[]][]): void {
-        let acceptPrompt = false;
-        // if there is mouse_on event after return prompt, then we don't need automatically accept it
-        // use case: easymotion search with jumping
-        let hasMouseOnAfterReturnPrompt = false;
-        batch.forEach(([name, ...args], idx) => {
-            // for (const [name, ...args] of batch) {
-            const firstArg = args[0] || [];
-            const lastArg = args[args.length - 1] || [];
-            switch (name) {
-                case "msg_showcmd": {
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    const [content] = firstArg as [string, any[]];
-                    let str = "";
-                    if (content) {
-                        for (const c of content) {
-                            const [, cmdStr] = c;
-                            if (cmdStr) {
-                                str += cmdStr;
-                            }
-                        }
-                    }
-                    this.statusLine.statusString = str;
-                    break;
-                }
-                case "msg_show": {
-                    let str = "";
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    for (const [type, content] of args as [string, any[], never][]) {
-                        // if (ui === "confirm" || ui === "confirmsub" || ui === "return_prompt") {
-                        //     this.nextInputBlocking = true;
-                        // }
-                        if (type === "return_prompt") {
-                            acceptPrompt = true;
-                            hasMouseOnAfterReturnPrompt = !!batch.slice(idx).find(([name]) => name === "mouse_on");
-                        }
-                        if (content) {
-                            for (const c of content) {
-                                const [, cmdStr] = c;
-                                if (cmdStr) {
-                                    str += cmdStr;
-                                }
-                            }
-                        }
-                    }
-                    this.statusLine.msgString = str;
-                    break;
-                }
-                case "msg_showmode": {
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    const [content] = lastArg as [any[]];
-                    let str = "";
-                    if (content) {
-                        for (const c of content) {
-                            const [, modeStr] = c;
-                            if (modeStr) {
-                                str += modeStr;
-                            }
-                        }
-                    }
-                    this.statusLine.modeString = str;
-                    break;
-                }
-                case "msg_clear": {
-                    this.statusLine.msgString = "";
-                    break;
-                }
+    private setStatus(status: string, type: StatusType): void {
+        switch (type) {
+            case StatusType.Mode:
+                this._modeText = status;
+                break;
+            case StatusType.Cmd:
+                this._cmdText = status;
+                break;
+            case StatusType.Msg:
+                this._msgText = status;
+                break;
+            case StatusType.StatusLine:
+                this._statusline = status;
+                break;
+        }
+        this.updateStatus();
+    }
+
+    private updateStatus() {
+        this.statusBar.text = [this._statusline, this._modeText, this._cmdText, this._msgText]
+            .map((i) => i.replace(/\n/g, " ").trim())
+            .filter((i) => i.length)
+            .join(config.statusLineSeparator);
+    }
+
+    private handleRedraw({ name, args }: EventBusData<"redraw">) {
+        switch (name) {
+            case "msg_showcmd": {
+                const [content] = args[0];
+                const cmdMsg = this.flattenMessageContent(content);
+                this.setStatus(cmdMsg, StatusType.Cmd);
+                break;
             }
-        });
-        if (acceptPrompt && !hasMouseOnAfterReturnPrompt) {
+            case "msg_show": {
+                this.handleMsgShow({ name, args });
+                break;
+            }
+            case "msg_showmode": {
+                const [content] = args[args.length - 1];
+                const modeMsg = this.flattenMessageContent(content);
+                this.setStatus(modeMsg, StatusType.Mode);
+                break;
+            }
+            case "msg_clear": {
+                this.handleMsgClear();
+                break;
+            }
+        }
+    }
+
+    dispose() {
+        disposeAll(this.disposables);
+    }
+
+    private handleMsgShow({ name, args }: EventBusData<"redraw">) {
+        if (name !== "msg_show") {
+            throw new Error("Expected a msg_show event");
+        }
+
+        this.ensurePressEnterCleared({ name, args });
+        this.messageDisplayTimer.onMessageEvent();
+
+        const msg = args.reduce((str, [type, content, replace]) => {
+            // There's no reason to put "Press ENTER to continue" in the status line
+            if (type === "return_prompt") {
+                return str;
+            }
+
+            const flattenedContent = content.map(([_code, msg]) => msg).join("");
+            if (replace) {
+                return flattenedContent;
+            }
+
+            return str + flattenedContent;
+        }, "");
+
+        this.setStatus(msg, StatusType.Msg);
+    }
+
+    private handleMsgClear() {
+        const action = this.messageDisplayTimer.onClearEvent();
+        switch (action) {
+            case ClearAction.PerformedClear:
+                logger.debug("Clearing statusline after event");
+                break;
+            case ClearAction.StagedClear:
+                logger.debug("Skipping statusline clear as a message is currently pending");
+                break;
+        }
+    }
+
+    private ensurePressEnterCleared({ name, args }: EventBusData<"redraw">) {
+        if (name !== "msg_show") {
+            throw new Error("Expected a msg_show event");
+        }
+
+        const returnPrompt = args.find(([type, _content]) => type === "return_prompt");
+        if (returnPrompt) {
             this.client.input("<CR>");
         }
+    }
+
+    private clearMessages() {
+        this.setStatus("", StatusType.Msg);
+    }
+
+    private flattenMessageContent(content: [number, string][]) {
+        return content.map(([_code, msg]) => msg).join("");
     }
 }

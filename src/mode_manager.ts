@@ -1,11 +1,10 @@
-import { EventEmitter } from "events";
+import { Disposable, EventEmitter } from "vscode";
 
-import { commands, Disposable } from "vscode";
+import { eventBus, EventBusData } from "./eventBus";
+import { createLogger } from "./logger";
+import { disposeAll, VSCodeContext } from "./utils";
 
-import { Logger } from "./logger";
-import { NeovimExtensionRequestProcessable } from "./neovim_events_processable";
-
-const LOG_PREFIX = "ModeManager";
+const logger = createLogger("ModeManager");
 
 // a representation of the current mode. can be read in different ways using accessors. underlying type is shortname name as returned by `:help mode()`
 export class Mode {
@@ -44,23 +43,35 @@ export class Mode {
     public get isNormal(): boolean {
         return this.name === "normal";
     }
+    public get isCmdline(): boolean {
+        return this.name === "cmdline";
+    }
 }
-export class ModeManager implements Disposable, NeovimExtensionRequestProcessable {
+export class ModeManager implements Disposable {
     private disposables: Disposable[] = [];
     /**
      * Current neovim mode
      */
-    private mode: Mode = new Mode();
+    private mode: Mode = new Mode("n");
     /**
      * True when macro recording in insert mode
      */
     private isRecording = false;
     private eventEmitter = new EventEmitter();
 
-    public constructor(private logger: Logger) {}
-
-    public dispose(): void {
-        this.disposables.forEach((d) => d.dispose());
+    constructor() {
+        this.disposables.push(
+            eventBus.on("mode-changed", this.handleModeChanged, this),
+            eventBus.on(
+                "notify-recording",
+                () => {
+                    logger.debug(`setting recording flag`);
+                    this.isRecording = true;
+                    VSCodeContext.set("neovim.recording", true);
+                },
+                this,
+            ),
+        );
     }
 
     public get currentMode(): Mode {
@@ -79,35 +90,31 @@ export class ModeManager implements Disposable, NeovimExtensionRequestProcessabl
         return this.mode.isNormal;
     }
 
+    public get isCmdlineMode(): boolean {
+        return this.mode.isCmdline;
+    }
+
     public get isRecordingInInsertMode(): boolean {
         return this.isRecording;
     }
 
-    public onModeChange(callback: () => void): void {
-        this.eventEmitter.on("neovimModeChanged", callback);
+    public onModeChange(callback: () => void): Disposable {
+        return this.eventEmitter.event(callback);
     }
 
-    public async handleExtensionRequest(name: string, args: unknown[]): Promise<void> {
-        switch (name) {
-            case "mode-changed": {
-                const [mode] = args as [string];
-                this.logger.debug(`${LOG_PREFIX}: Changing mode to ${mode}`);
-                this.mode = new Mode(mode);
-                if (!this.isInsertMode && this.isRecording) {
-                    this.isRecording = false;
-                    commands.executeCommand("setContext", "neovim.recording", false);
-                }
-                commands.executeCommand("setContext", "neovim.mode", this.mode.name);
-                this.logger.debug(`${LOG_PREFIX}: Setting mode context to ${this.mode.name}`);
-                this.eventEmitter.emit("neovimModeChanged");
-                break;
-            }
-            case "notify-recording": {
-                this.logger.debug(`${LOG_PREFIX}: setting recording flag`);
-                this.isRecording = true;
-                commands.executeCommand("setContext", "neovim.recording", true);
-                break;
-            }
+    private handleModeChanged([mode]: EventBusData<"mode-changed">) {
+        logger.debug(`Changing mode to ${mode}`);
+        this.mode = new Mode(mode);
+        if (!this.isInsertMode && this.isRecording) {
+            this.isRecording = false;
+            VSCodeContext.set("neovim.recording", false);
         }
+        VSCodeContext.set("neovim.mode", this.mode.name);
+        logger.debug(`Setting mode context to ${this.mode.name}`);
+        this.eventEmitter.fire(null);
+    }
+
+    dispose() {
+        disposeAll(this.disposables);
     }
 }
